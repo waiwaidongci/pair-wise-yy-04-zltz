@@ -1,7 +1,8 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, ref } from 'vue'
 import { useSheetStore } from '../stores/sheet'
-import { columnLabel, displayValue, normalizeRange } from '../utils/cells'
+import { columnLabel, normalizeRange } from '../utils/cells'
+import CellValue from './CellValue.vue'
 
 const store = useSheetStore()
 const viewport = ref<HTMLElement | null>(null)
@@ -206,7 +207,7 @@ onUnmounted(() => {
         @mousedown="selectCell(row, col, $event)"
         @dblclick="startEdit(row, col)"
       >
-        <span class="cell-value">{{ store.getRecord(row, col)?.error || displayValue(store.getRecord(row, col)?.value) }}</span>
+        <CellValue :row="row" :col="col" />
       </div>
     </template>
 
@@ -229,9 +230,7 @@ onUnmounted(() => {
           @keydown.enter.prevent="commitEdit(); move(1, 0)"
           @keydown.escape.prevent="cancelEdit"
         />
-        <span v-else class="cell-value" :class="{ error: store.getRecord(row, col)?.error }">
-          {{ store.getRecord(row, col)?.error || displayValue(store.getRecord(row, col)?.value) }}
-        </span>
+        <CellValue v-else :row="row" :col="col" />
       </div>
     </template>
 
@@ -254,9 +253,7 @@ onUnmounted(() => {
           @keydown.enter.prevent="commitEdit(); move(1, 0)"
           @keydown.escape.prevent="cancelEdit"
         />
-        <span v-else class="cell-value" :class="{ error: store.getRecord(row, col)?.error }">
-          {{ store.getRecord(row, col)?.error || displayValue(store.getRecord(row, col)?.value) }}
-        </span>
+        <CellValue v-else :row="row" :col="col" />
       </div>
     </template>
   </div>
@@ -323,8 +320,6 @@ onUnmounted(() => {
 .cell.selected { background: rgba(59, 130, 246, .09); }
 .cell.active { z-index: 4; outline: 2px solid #2563eb; outline-offset: -2px; background: #fff; }
 .cell.frozen-cell { z-index: 5; box-shadow: 2px 0 5px rgba(30, 45, 65, .04); }
-.cell-value { width: 100%; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
-.cell-value.error { color: #dc2626; font-family: ui-monospace, monospace; font-size: 11px; }
 .cell-editor {
   width: calc(100% + 14px);
   height: 100%;

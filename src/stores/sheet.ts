@@ -1,11 +1,15 @@
 import { computed, ref } from 'vue'
 import { defineStore } from 'pinia'
-import type { CellCoord, CellMap, CellRange, CellRecord, CellValue } from '../types/sheet'
+import type { CellCoord, CellMap, CellRange, CellRecord, CellValue, IterationOptions } from '../types/sheet'
+import { DEFAULT_ITERATION, NOCONV_WARNING } from '../types/sheet'
 import { cellId, displayValue, literalValue, normalizeRange, rangeContains } from '../utils/cells'
-import { FormulaError, evaluateAst, formulaDependencies, parseFormula } from '../utils/formula'
+import { DependencyGraph, recalculate } from '../utils/recalc'
 
 const ROWS = 1000
 const COLS = 26
+/** 重算中途失败后的重试次数：成功算出结果后才允许覆盖旧值 */
+const RECALC_RETRIES = 2
+const RETRY_DELAY_MS = 120
 
 function createStarterCells(): CellMap {
   const cells: CellMap = {}
@@ -51,6 +55,34 @@ function createStarterCells(): CellMap {
   put('B11', '=MIN(E2:E5)')
   put('A13', '达标说明')
   put('B13', '=IF(E6>1500000,"达成季度目标","需要关注")')
+
+  // 滚动预算示例：成本、返点、毛利互相引用，依赖反复代入求解
+  put('A16', '滚动预算示例（循环代入）')
+  put('A17', '收入基数')
+  put('B17', '40000')
+  put('A18', '成本率')
+  put('B18', '0.6')
+  put('A19', '返点率')
+  put('B19', '0.01')
+  put('A21', '收入')
+  put('B21', '=B17+B23')
+  put('A22', '成本')
+  put('B22', '=ROUND(B21*B18,2)')
+  put('A23', '返点')
+  put('B23', '=ROUND(B21*B19,2)')
+  put('A24', '毛利')
+  put('B24', '=ROUND(B21-B22-B23,2)')
+  put('C21', '收入 = 基数+返点')
+  put('C22', '成本 = 收入×成本率')
+  put('C23', '返点 = 收入×返点率')
+  put('C24', '毛利 = 收入-成本-返点')
+
+  // 结构性不收敛示例：两格互相加 1，到达代入上限后保留末次数字并标出
+  put('A27', '不收敛示例（保留末次值）')
+  put('A28', '振荡X')
+  put('B28', '=B29+1')
+  put('A29', '振荡Y')
+  put('B29', '=B28+1')
   return cells
 }
 
@@ -59,6 +91,13 @@ interface HistorySnapshot {
   active: CellCoord
   selection: CellRange
 }
+
+/** 深拷贝单元格结果；非有限数（极端发散）序列化为 null，防止 JSON 丢失成 null 造成歧义 */
+function cloneCells(source: CellMap): CellMap {
+  return JSON.parse(JSON.stringify(source)) as CellMap
+}
+
+const wait = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms))
 
 export const useSheetStore = defineStore('sheet', () => {
   const rows = ROWS
@@ -69,9 +108,16 @@ export const useSheetStore = defineStore('sheet', () => {
   const freezeRows = ref(1)
   const freezeCols = ref(1)
   const lastRecalculated = ref<string[]>([])
+  const iteration = ref<IterationOptions>({ ...DEFAULT_ITERATION })
+  const busy = ref(false)
   const history = ref<HistorySnapshot[]>([])
   const future = ref<HistorySnapshot[]>([])
   const status = ref('工作簿已加载，公式引擎待命')
+
+  const graph = new DependencyGraph()
+  /** 串行任务队列：所有编辑/重算/撤销/导出排队执行，保证“算完再覆盖” */
+  const taskQueue: Array<() => Promise<void>> = []
+  let draining = false
 
   const activeRaw = computed(() => getRaw(active.value.row, active.value.col))
   const activeValue = computed(() => cells.value[cellId(active.value.row, active.value.col)]?.value ?? null)
@@ -90,129 +136,105 @@ export const useSheetStore = defineStore('sheet', () => {
     return cells.value[idFor(row, col)]
   }
 
-  function dependencyMap() {
-    const map = new Map<string, Set<string>>()
-    Object.entries(cells.value).forEach(([id, cell]) => {
-      if (!cell.raw.startsWith('=')) return
-      const deps = formulaDependencies(cell.raw)
-      deps.forEach((dep) => map.set(dep, new Set([...(map.get(dep) ?? []), id])))
-    })
-    return map
-  }
-
-  function affectedCells(startIds: string[]) {
-    const map = dependencyMap()
-    const affected = new Set(startIds)
-    const queue = [...startIds]
-    while (queue.length) {
-      const id = queue.shift()!
-      for (const dependent of map.get(id) ?? []) {
-        if (!affected.has(dependent)) {
-          affected.add(dependent)
-          queue.push(dependent)
-        }
-      }
-    }
-    return affected
-  }
-
-  function recalculate(ids: Set<string>) {
-    const resolved = new Map<string, CellValue>()
-    const failedCycles = new Set<string>()
-
-    const resolve = (id: string, stack: string[]): CellValue => {
-      if (resolved.has(id)) return resolved.get(id) ?? null
-      if (stack.includes(id)) {
-        stack.forEach((item) => failedCycles.add(item))
-        throw new FormulaError('#CYCLE!')
-      }
-      const record = cells.value[id]
-      if (!record) return null
-      if (!record.raw.startsWith('=')) {
-        const value = literalValue(record.raw)
-        resolved.set(id, value)
-        return value
-      }
-      const ast = parseFormula(record.raw)
-      const nextStack = [...stack, id]
-      const value = evaluateAst(
-        ast,
-        (reference) => resolve(reference, nextStack),
-        (range) => {
-          const [start, end] = range.split(':')
-          const startCoord = cells.value[start] ? start : start
-          const endCoord = cells.value[end] ? end : end
-          const idsInRange: string[] = []
-          const startMatch = /^([A-Z]+)(\d+)$/i.exec(startCoord)
-          const endMatch = /^([A-Z]+)(\d+)$/i.exec(endCoord)
-          if (startMatch && endMatch) {
-            const startCol = startMatch[1].toUpperCase().split('').reduce((sum, char) => sum * 26 + char.charCodeAt(0) - 64, 0) - 1
-            const endCol = endMatch[1].toUpperCase().split('').reduce((sum, char) => sum * 26 + char.charCodeAt(0) - 64, 0) - 1
-            for (let row = Number(startMatch[2]) - 1; row <= Number(endMatch[2]) - 1; row += 1) {
-              for (let col = startCol; col <= endCol; col += 1) idsInRange.push(cellId(row, col))
-            }
-          }
-          return idsInRange.map((cell) => resolve(cell, nextStack))
-        },
-      ) as CellValue
-      resolved.set(id, value)
-      return value
-    }
-
-    ids.forEach((id) => {
-      try {
-        const value = resolve(id, [])
-        const record = cells.value[id]
-        if (record) cells.value[id] = { ...record, value, error: undefined }
-      } catch (error) {
-        const record = cells.value[id]
-        if (record) {
-          const code = error instanceof FormulaError ? error.code : '#ERROR!'
-          cells.value[id] = { ...record, value: null, error: failedCycles.has(id) ? '#CYCLE!' : code }
-        }
-      }
-    })
-    lastRecalculated.value = [...ids]
-    status.value = `已重算 ${ids.size} 个受影响单元格`
-  }
-
   function snapshot(): HistorySnapshot {
     return {
-      cells: JSON.parse(JSON.stringify(cells.value)) as CellMap,
+      cells: cloneCells(cells.value),
       active: { ...active.value },
       selection: { start: { ...selection.value.start }, end: { ...selection.value.end } },
     }
   }
 
-  function recordHistory() {
+  function enqueue(task: () => Promise<void>) {
+    taskQueue.push(task)
+    void drainQueue()
+  }
+
+  async function drainQueue() {
+    if (draining) return
+    draining = true
+    busy.value = true
+    try {
+      while (taskQueue.length) {
+        const task = taskQueue.shift()!
+        await task()
+      }
+    } finally {
+      busy.value = false
+      draining = false
+    }
+  }
+
+  /**
+   * 计算受影响闭包并重试：计算过程不触碰当前结果，只有成功后才整体覆盖。
+   * 中途失败（意外异常）先重试，仍失败则保留旧结果并报错，绝不半写。
+   */
+  async function recomputeAndCommit(changedIds: string[]): Promise<boolean> {
+    const roots = graph.closure(changedIds)
+    let lastError: unknown
+    for (let attempt = 0; attempt <= RECALC_RETRIES; attempt += 1) {
+      try {
+        const outcome = await recalculate(cells.value, graph, roots, iteration.value)
+        // 成功算出后才覆盖旧结果（同一批结果一次性提交）
+        for (const [id, result] of outcome.updates) {
+          const record = cells.value[id]
+          if (record) cells.value[id] = { ...record, ...result }
+        }
+        lastRecalculated.value = [...outcome.updates.keys()]
+        if (outcome.cycleGroups === 0) {
+          status.value = `已重算 ${outcome.updates.size} 个受影响单元格`
+        } else if (outcome.unconvergedGroups.length) {
+          const count = outcome.unconvergedGroups.reduce((sum, group) => sum + group.length, 0)
+          status.value = `循环代入：${outcome.convergedGroups} 组已收敛，${outcome.unconvergedGroups.length} 组达上限未收敛，${count} 格保留末次值并标 ${NOCONV_WARNING}`
+        } else {
+          const rounds = Math.max(...outcome.iterations, 0)
+          status.value = `循环代入 ${outcome.cycleGroups} 组全部收敛（最多 ${rounds} 轮），共重算 ${outcome.updates.size} 格`
+        }
+        return true
+      } catch (error) {
+        lastError = error
+        if (attempt < RECALC_RETRIES) await wait(RETRY_DELAY_MS * (attempt + 1))
+      }
+    }
+    status.value = `重算失败，已重试 ${RECALC_RETRIES} 次，旧结果保留未覆盖`
+    console.error('[sheet] recalculate failed after retries', lastError)
+    return false
+  }
+
+  function pushHistory() {
     history.value.push(snapshot())
     if (history.value.length > 80) history.value.shift()
     future.value = []
   }
 
+  /** 单格编辑：先入历史，再改 raw、更新依赖图边，然后只重算受影响闭包（含受影响循环组） */
   function setRaw(row: number, col: number, raw: string, record = true) {
-    if (record) recordHistory()
-    const id = idFor(row, col)
-    const existing = cells.value[id]
-    if ((existing?.raw ?? '') === raw) return
-    cells.value[id] = { raw, value: raw.startsWith('=') ? null : literalValue(raw) }
-    recalculate(affectedCells([id]))
+    enqueue(async () => {
+      const id = idFor(row, col)
+      if ((cells.value[id]?.raw ?? '') === raw) return
+      if (record) pushHistory()
+      cells.value[id] = { raw, value: raw.startsWith('=') ? null : literalValue(raw) }
+      graph.setCell(id, raw)
+      await recomputeAndCommit([id])
+    })
   }
 
   function setManyRaw(start: CellCoord, matrix: string[][]) {
-    recordHistory()
-    const changed: string[] = []
-    matrix.forEach((rowValues, rowOffset) => {
-      rowValues.forEach((raw, colOffset) => {
-        const row = start.row + rowOffset
-        const col = start.col + colOffset
-        if (row >= rows || col >= cols) return
-        const id = idFor(row, col)
-        cells.value[id] = { raw, value: raw.startsWith('=') ? null : literalValue(raw) }
-        changed.push(id)
+    enqueue(async () => {
+      pushHistory()
+      const changed: string[] = []
+      matrix.forEach((rowValues, rowOffset) => {
+        rowValues.forEach((raw, colOffset) => {
+          const row = start.row + rowOffset
+          const col = start.col + colOffset
+          if (row >= rows || col >= cols) return
+          const id = idFor(row, col)
+          cells.value[id] = { raw, value: raw.startsWith('=') ? null : literalValue(raw) }
+          graph.setCell(id, raw)
+          changed.push(id)
+        })
       })
+      if (changed.length) await recomputeAndCommit(changed)
     })
-    recalculate(affectedCells(changed))
   }
 
   function setActive(row: number, col: number, extend = false) {
@@ -258,62 +280,95 @@ export const useSheetStore = defineStore('sheet', () => {
     setManyRaw(range.start, matrix)
   }
 
-  function undo() {
-    const previous = history.value.pop()
-    if (!previous) return
-    future.value.push(snapshot())
-    cells.value = previous.cells
-    active.value = previous.active
-    selection.value = previous.selection
-    recalculate(new Set(Object.keys(cells.value)))
-    status.value = '已撤销上一步编辑'
-  }
-
-  function redo() {
-    const next = future.value.pop()
-    if (!next) return
-    history.value.push(snapshot())
+  /** 撤销/重做恢复的快照已带同一批算好的结果，直接连同结果一起恢复，不再重算 */
+  function restoreSnapshot(next: HistorySnapshot) {
     cells.value = next.cells
     active.value = next.active
     selection.value = next.selection
-    recalculate(new Set(Object.keys(cells.value)))
-    status.value = '已恢复编辑'
+    graph.sync(cells.value)
+    lastRecalculated.value = Object.keys(cells.value).filter((id) => cells.value[id].raw.startsWith('='))
+  }
+
+  function undo() {
+    enqueue(async () => {
+      const previous = history.value.pop()
+      if (!previous) return
+      future.value.push(snapshot())
+      restoreSnapshot(previous)
+      status.value = '已撤销上一步编辑（恢复同批计算结果）'
+    })
+  }
+
+  function redo() {
+    enqueue(async () => {
+      const next = future.value.pop()
+      if (!next) return
+      history.value.push(snapshot())
+      restoreSnapshot(next)
+      status.value = '已恢复编辑（使用同一批结果）'
+    })
   }
 
   function isSelected(row: number, col: number) {
     return rangeContains(selection.value, row, col)
   }
 
+  /** 导出排在队列尾部：等在途重算完成，导出的就是屏幕上同一批结果 */
   function exportCsv() {
-    const lines: string[] = []
-    for (let row = 0; row < Math.min(rows, 80); row += 1) {
-      const values: string[] = []
-      let hasData = false
-      for (let col = 0; col < cols; col += 1) {
-        const record = getRecord(row, col)
-        if (record?.raw) hasData = true
-        values.push(`"${displayValue(record?.value ?? '').replace(/"/g, '""')}"`)
+    enqueue(async () => {
+      const lines: string[] = []
+      for (let row = 0; row < Math.min(rows, 80); row += 1) {
+        const values: string[] = []
+        let hasData = false
+        for (let col = 0; col < cols; col += 1) {
+          const record = getRecord(row, col)
+          if (record?.raw) hasData = true
+          // 错误码照导出；不收敛警示不影响数值，导出保留的末次结果
+          const shown = record?.error ?? displayValue(record?.value ?? '')
+          values.push(`"${shown.replace(/"/g, '""')}"`)
+        }
+        if (hasData || row < 30) lines.push(values.join(','))
       }
-      if (hasData || row < 15) lines.push(values.join(','))
-    }
-    const blob = new Blob([`\uFEFF${lines.join('\n')}`], { type: 'text/csv;charset=utf-8' })
-    const url = URL.createObjectURL(blob)
-    const anchor = document.createElement('a')
-    anchor.href = url
-    anchor.download = '季度销售公式表.csv'
-    anchor.click()
-    URL.revokeObjectURL(url)
-    status.value = 'CSV 已导出'
+      const blob = new Blob([`﻿${lines.join('\n')}`], { type: 'text/csv;charset=utf-8' })
+      const url = URL.createObjectURL(blob)
+      const anchor = document.createElement('a')
+      anchor.href = url
+      anchor.download = '季度销售公式表.csv'
+      anchor.click()
+      URL.revokeObjectURL(url)
+      status.value = 'CSV 已导出（使用当前同一批结果）'
+    })
   }
 
   function reset() {
-    recordHistory()
-    cells.value = createStarterCells()
-    recalculate(new Set(Object.keys(cells.value)))
-    status.value = '已恢复示例工作簿'
+    enqueue(async () => {
+      pushHistory()
+      cells.value = createStarterCells()
+      graph.sync(cells.value)
+      await recomputeFromScratch()
+      status.value = '已恢复示例工作簿'
+    })
   }
 
-  recalculate(new Set(Object.keys(cells.value)))
+  /** 整表重算：仅用于首次加载（撤销/重做/恢复直接带结果，不走这里，避免整表一起算） */
+  async function recomputeFromScratch() {
+    const formulaIds = Object.entries(cells.value)
+      .filter(([, record]) => record.raw.startsWith('='))
+      .map(([id]) => id)
+    await recomputeAndCommit(formulaIds)
+  }
+
+  function updateIterationOptions(patch: Partial<IterationOptions>) {
+    enqueue(async () => {
+      iteration.value = { ...iteration.value, ...patch }
+      // 参数变化属于全局重算：仍按循环组分批代入，不是整表一把算
+      await recomputeFromScratch()
+    })
+  }
+
+  graph.sync(cells.value)
+  // 首次重算也走同一串行队列，避免与用户的即时编辑并发写结果
+  enqueue(recomputeFromScratch)
 
   return {
     rows,
@@ -326,6 +381,8 @@ export const useSheetStore = defineStore('sheet', () => {
     freezeRows,
     freezeCols,
     lastRecalculated,
+    iteration,
+    busy,
     canUndo,
     canRedo,
     status,
@@ -345,5 +402,6 @@ export const useSheetStore = defineStore('sheet', () => {
     isSelected,
     exportCsv,
     reset,
+    updateIterationOptions,
   }
 })
