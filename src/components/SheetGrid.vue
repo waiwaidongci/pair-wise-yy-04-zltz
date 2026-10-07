@@ -64,6 +64,10 @@ function enterCell(row: number, col: number) {
   if (selecting.value) store.setSelectionEnd(row, col)
 }
 
+function recordAt(row: number, col: number) {
+  return store.getRecord(row, col)
+}
+
 function startEdit(row?: number, col?: number) {
   const target = row === undefined || col === undefined ? store.active : { row, col }
   store.setActive(target.row, target.col)
@@ -206,7 +210,7 @@ onUnmounted(() => {
         @mousedown="selectCell(row, col, $event)"
         @dblclick="startEdit(row, col)"
       >
-        <span class="cell-value">{{ store.getRecord(row, col)?.error || displayValue(store.getRecord(row, col)?.value) }}</span>
+        <span class="cell-value">{{ recordAt(row, col)?.error || displayValue(recordAt(row, col)?.value) }}</span>
       </div>
     </template>
 
@@ -229,8 +233,9 @@ onUnmounted(() => {
           @keydown.enter.prevent="commitEdit(); move(1, 0)"
           @keydown.escape.prevent="cancelEdit"
         />
-        <span v-else class="cell-value" :class="{ error: store.getRecord(row, col)?.error }">
-          {{ store.getRecord(row, col)?.error || displayValue(store.getRecord(row, col)?.value) }}
+        <span v-else class="cell-value" :class="{ error: recordAt(row, col)?.error, 'non-converged': recordAt(row, col)?.converged === false }">
+          <template v-if="recordAt(row, col)?.error">{{ recordAt(row, col)?.error }}</template>
+          <template v-else>{{ displayValue(recordAt(row, col)?.value) }}<span v-if="recordAt(row, col)?.converged === false" class="conv-badge" title="迭代未收敛，已保留最近一次代入结果">⚠</span></template>
         </span>
       </div>
     </template>
@@ -254,8 +259,9 @@ onUnmounted(() => {
           @keydown.enter.prevent="commitEdit(); move(1, 0)"
           @keydown.escape.prevent="cancelEdit"
         />
-        <span v-else class="cell-value" :class="{ error: store.getRecord(row, col)?.error }">
-          {{ store.getRecord(row, col)?.error || displayValue(store.getRecord(row, col)?.value) }}
+        <span v-else class="cell-value" :class="{ error: recordAt(row, col)?.error, 'non-converged': recordAt(row, col)?.converged === false }">
+          <template v-if="recordAt(row, col)?.error">{{ recordAt(row, col)?.error }}</template>
+          <template v-else>{{ displayValue(recordAt(row, col)?.value) }}<span v-if="recordAt(row, col)?.converged === false" class="conv-badge" title="迭代未收敛，已保留最近一次代入结果">⚠</span></template>
         </span>
       </div>
     </template>
@@ -325,6 +331,8 @@ onUnmounted(() => {
 .cell.frozen-cell { z-index: 5; box-shadow: 2px 0 5px rgba(30, 45, 65, .04); }
 .cell-value { width: 100%; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
 .cell-value.error { color: #dc2626; font-family: ui-monospace, monospace; font-size: 11px; }
+.cell-value.non-converged { color: #b45309; }
+.conv-badge { margin-left: 3px; font-size: 10px; color: #d97706; }
 .cell-editor {
   width: calc(100% + 14px);
   height: 100%;

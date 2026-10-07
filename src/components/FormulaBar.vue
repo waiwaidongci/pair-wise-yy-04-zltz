@@ -28,6 +28,9 @@ function commit() {
     <span v-if="store.getRecord(store.active.row, store.active.col)?.error" class="formula-error">
       {{ store.getRecord(store.active.row, store.active.col)?.error }}
     </span>
+    <span v-if="store.getRecord(store.active.row, store.active.col)?.converged === false" class="formula-warn">
+      迭代未收敛，已保留最近一次代入结果
+    </span>
   </div>
 </template>
 
@@ -38,4 +41,5 @@ function commit() {
 .formula-input { flex: 1; min-width: 0; height: 28px; padding: 0 8px; border: 1px solid #d8e0ea; border-radius: 4px; outline: none; color: #1e293b; font: 12px ui-monospace, monospace; }
 .formula-input:focus { border-color: #3b82f6; box-shadow: 0 0 0 2px rgba(59,130,246,.12); }
 .formula-error { color: #dc2626; font-size: 11px; font-weight: 700; }
+.formula-warn { color: #b45309; font-size: 11px; font-weight: 700; }
 </style>

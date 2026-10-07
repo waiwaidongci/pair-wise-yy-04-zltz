@@ -1,7 +1,8 @@
 import { computed, ref } from 'vue'
 import { defineStore } from 'pinia'
-import type { CellCoord, CellMap, CellRange, CellRecord, CellValue } from '../types/sheet'
-import { cellId, displayValue, literalValue, normalizeRange, rangeContains } from '../utils/cells'
+import type { CellCoord, CellMap, CellRange, CellRecord, CellValue, FormulaAst } from '../types/sheet'
+import { cellId, displayValue, expandRange, literalValue, normalizeRange, rangeContains } from '../utils/cells'
+import { isCyclicScc, solveCycleGroup, tarjanScc } from '../utils/cycles'
 import { FormulaError, evaluateAst, formulaDependencies, parseFormula } from '../utils/formula'
 
 const ROWS = 1000
@@ -51,6 +52,16 @@ function createStarterCells(): CellMap {
   put('B11', '=MIN(E2:E5)')
   put('A13', '达标说明')
   put('B13', '=IF(E6>1500000,"达成季度目标","需要关注")')
+  // 滚动预算示例：返点与毛利互相引用，形成循环引用，由迭代代入求解
+  put('A15', '滚动预算示例')
+  put('A16', '收入')
+  put('B16', '100000')
+  put('A17', '成本')
+  put('B17', '=B16*0.6')
+  put('A18', '返点')
+  put('B18', '=B19*0.05')
+  put('A19', '毛利')
+  put('B19', '=B16-B17-B18')
   return cells
 }
 
@@ -90,23 +101,29 @@ export const useSheetStore = defineStore('sheet', () => {
     return cells.value[idFor(row, col)]
   }
 
-  function dependencyMap() {
-    const map = new Map<string, Set<string>>()
-    Object.entries(cells.value).forEach(([id, cell]) => {
-      if (!cell.raw.startsWith('=')) return
-      const deps = formulaDependencies(cell.raw)
-      deps.forEach((dep) => map.set(dep, new Set([...(map.get(dep) ?? []), id])))
-    })
-    return map
+  function buildGraph() {
+    const formulaIds = Object.keys(cells.value).filter((id) => cells.value[id]?.raw.startsWith('='))
+    const formulaSet = new Set(formulaIds)
+    const depsOf = new Map<string, Set<string>>()
+    const dependentsOf = new Map<string, Set<string>>()
+    for (const id of formulaIds) {
+      const deps = formulaDependencies(cells.value[id].raw)
+      const filtered = new Set([...deps].filter((dep) => formulaSet.has(dep)))
+      depsOf.set(id, filtered)
+      for (const dep of filtered) {
+        if (!dependentsOf.has(dep)) dependentsOf.set(dep, new Set())
+        dependentsOf.get(dep)!.add(id)
+      }
+    }
+    return { formulaIds, depsOf, dependentsOf }
   }
 
-  function affectedCells(startIds: string[]) {
-    const map = dependencyMap()
+  function computeAffected(startIds: Set<string>, dependentsOf: Map<string, Set<string>>): Set<string> {
     const affected = new Set(startIds)
     const queue = [...startIds]
     while (queue.length) {
       const id = queue.shift()!
-      for (const dependent of map.get(id) ?? []) {
+      for (const dependent of dependentsOf.get(id) ?? []) {
         if (!affected.has(dependent)) {
           affected.add(dependent)
           queue.push(dependent)
@@ -116,16 +133,66 @@ export const useSheetStore = defineStore('sheet', () => {
     return affected
   }
 
-  function recalculate(ids: Set<string>) {
-    const resolved = new Map<string, CellValue>()
-    const failedCycles = new Set<string>()
-
-    const resolve = (id: string, stack: string[]): CellValue => {
-      if (resolved.has(id)) return resolved.get(id) ?? null
-      if (stack.includes(id)) {
-        stack.forEach((item) => failedCycles.add(item))
-        throw new FormulaError('#CYCLE!')
+  function recalculate(startIds: Set<string>) {
+    // 先在临时缓冲区里算，失败重试，成功后再整体写回，避免中途失败覆盖旧结果
+    let result: BatchResult | null = null
+    for (let attempt = 0; attempt < 2 && !result; attempt += 1) {
+      try {
+        result = computeBatch(startIds)
+      } catch {
+        // 中途失败：重试一次；仍失败则保留上一次结果
       }
+    }
+    if (!result) {
+      status.value = '重算失败，已保留上一次结果'
+      return
+    }
+    const { out, convergedGroups, nonConvergedGroups } = result
+    const next = { ...cells.value }
+    for (const [id, record] of out) next[id] = record
+    cells.value = next
+    lastRecalculated.value = [...out.keys()]
+    if (nonConvergedGroups > 0) {
+      status.value = `已重算 ${out.size} 个受影响单元格，${convergedGroups} 个循环组收敛，${nonConvergedGroups} 个未收敛（保留最近代入结果）`
+    } else if (convergedGroups > 0) {
+      status.value = `已重算 ${out.size} 个受影响单元格，${convergedGroups} 个循环组已迭代收敛`
+    } else {
+      status.value = `已重算 ${out.size} 个受影响单元格`
+    }
+  }
+
+  interface BatchResult {
+    out: Map<string, CellRecord>
+    convergedGroups: number
+    nonConvergedGroups: number
+  }
+
+  function computeBatch(startIds: Set<string>): BatchResult {
+    const { formulaIds, depsOf, dependentsOf } = buildGraph()
+    const affected = computeAffected(startIds, dependentsOf)
+
+    const sccs = tarjanScc(formulaIds, depsOf)
+    const sccOf = new Map<string, number>()
+    sccs.forEach((scc, index) => scc.forEach((id) => sccOf.set(id, index)))
+    const cyclicFlags = sccs.map((scc) => isCyclicScc(scc, depsOf))
+
+    // 预解析所有公式，避免迭代时重复解析
+    const astCache = new Map<string, FormulaAst>()
+    for (const id of formulaIds) astCache.set(id, parseFormula(cells.value[id].raw))
+
+    const resolved = new Map<string, CellValue>()
+    const out = new Map<string, CellRecord>()
+    let convergedGroups = 0
+    let nonConvergedGroups = 0
+
+    // 字面量单元格直接入解析缓存
+    for (const [id, record] of Object.entries(cells.value)) {
+      if (!record.raw.startsWith('=')) resolved.set(id, literalValue(record.raw))
+    }
+
+    // 环外读取：已解析的用最新值，未受影响的公式格沿用旧值
+    const readRef = (id: string): CellValue => {
+      if (resolved.has(id)) return resolved.get(id) as CellValue
       const record = cells.value[id]
       if (!record) return null
       if (!record.raw.startsWith('=')) {
@@ -133,47 +200,99 @@ export const useSheetStore = defineStore('sheet', () => {
         resolved.set(id, value)
         return value
       }
-      const ast = parseFormula(record.raw)
-      const nextStack = [...stack, id]
-      const value = evaluateAst(
-        ast,
-        (reference) => resolve(reference, nextStack),
-        (range) => {
-          const [start, end] = range.split(':')
-          const startCoord = cells.value[start] ? start : start
-          const endCoord = cells.value[end] ? end : end
-          const idsInRange: string[] = []
-          const startMatch = /^([A-Z]+)(\d+)$/i.exec(startCoord)
-          const endMatch = /^([A-Z]+)(\d+)$/i.exec(endCoord)
-          if (startMatch && endMatch) {
-            const startCol = startMatch[1].toUpperCase().split('').reduce((sum, char) => sum * 26 + char.charCodeAt(0) - 64, 0) - 1
-            const endCol = endMatch[1].toUpperCase().split('').reduce((sum, char) => sum * 26 + char.charCodeAt(0) - 64, 0) - 1
-            for (let row = Number(startMatch[2]) - 1; row <= Number(endMatch[2]) - 1; row += 1) {
-              for (let col = startCol; col <= endCol; col += 1) idsInRange.push(cellId(row, col))
-            }
-          }
-          return idsInRange.map((cell) => resolve(cell, nextStack))
-        },
-      ) as CellValue
-      resolved.set(id, value)
-      return value
+      return record.value ?? null
+    }
+    const readRange = (range: string): CellValue[] => {
+      const [start, end] = range.split(':')
+      return expandRange(start, end).map((id) => readRef(id))
     }
 
-    ids.forEach((id) => {
-      try {
-        const value = resolve(id, [])
-        const record = cells.value[id]
-        if (record) cells.value[id] = { ...record, value, error: undefined }
-      } catch (error) {
-        const record = cells.value[id]
-        if (record) {
-          const code = error instanceof FormulaError ? error.code : '#ERROR!'
-          cells.value[id] = { ...record, value: null, error: failedCycles.has(id) ? '#CYCLE!' : code }
+    const evaluateCell = (id: string, resolveRef: (ref: string) => CellValue, resolveRange: (range: string) => CellValue[]): CellValue => {
+      const ast = astCache.get(id) ?? parseFormula(cells.value[id].raw)
+      return evaluateAst(ast, resolveRef, resolveRange) as CellValue
+    }
+
+    const evaluating = new Set<number>()
+    const evaluateScc = (sccId: number) => {
+      if (sccs[sccId].every((id) => resolved.has(id))) return
+      if (evaluating.has(sccId)) throw new FormulaError('#CYCLE!')
+      evaluating.add(sccId)
+      const scc = sccs[sccId]
+
+      // 先计算本 SCC 依赖的其他 SCC，保证环外公式读到最新值
+      const depSccs = new Set<number>()
+      for (const id of scc) {
+        for (const dep of depsOf.get(id) ?? []) {
+          const depScc = sccOf.get(dep)
+          if (depScc !== undefined && depScc !== sccId) depSccs.add(depScc)
         }
       }
-    })
-    lastRecalculated.value = [...ids]
-    status.value = `已重算 ${ids.size} 个受影响单元格`
+      depSccs.forEach((dep) => evaluateScc(dep))
+
+      const sccAffected = scc.some((id) => affected.has(id))
+      if (!sccAffected) {
+        for (const id of scc) {
+          if (!resolved.has(id)) resolved.set(id, cells.value[id]?.value ?? null)
+        }
+        evaluating.delete(sccId)
+        return
+      }
+
+      if (cyclicFlags[sccId]) {
+        const solution = solveCycleGroup(
+          scc,
+          (id) => cells.value[id]?.value ?? null,
+          evaluateCell,
+          readRef,
+        )
+        if (solution.converged) convergedGroups += 1
+        else nonConvergedGroups += 1
+        for (const id of scc) {
+          const record = cells.value[id]
+          const error = solution.errors.get(id)
+          const value = solution.values.get(id) ?? null
+          resolved.set(id, value)
+          out.set(id, {
+            raw: record.raw,
+            value,
+            error,
+            converged: error ? undefined : solution.converged ? undefined : false,
+          })
+        }
+      } else {
+        for (const id of scc) {
+          const record = cells.value[id]
+          try {
+            const value = evaluateCell(id, readRef, readRange)
+            resolved.set(id, value)
+            out.set(id, { raw: record.raw, value })
+          } catch (error) {
+            const code = error instanceof FormulaError ? error.code : '#ERROR!'
+            resolved.set(id, null)
+            out.set(id, { raw: record.raw, value: null, error: code })
+          }
+        }
+      }
+      evaluating.delete(sccId)
+    }
+
+    // 只代入受影响的循环组，不整表一起算
+    const affectedSccs = new Set<number>()
+    for (const id of affected) {
+      const sccId = sccOf.get(id)
+      if (sccId !== undefined) affectedSccs.add(sccId)
+    }
+    affectedSccs.forEach((sccId) => evaluateScc(sccId))
+
+    // 受影响的字面量单元格也写回，保持 value 与 raw 一致
+    for (const id of affected) {
+      const record = cells.value[id]
+      if (record && !record.raw.startsWith('=') && !out.has(id)) {
+        out.set(id, { raw: record.raw, value: literalValue(record.raw) })
+      }
+    }
+
+    return { out, convergedGroups, nonConvergedGroups }
   }
 
   function snapshot(): HistorySnapshot {
@@ -196,7 +315,7 @@ export const useSheetStore = defineStore('sheet', () => {
     const existing = cells.value[id]
     if ((existing?.raw ?? '') === raw) return
     cells.value[id] = { raw, value: raw.startsWith('=') ? null : literalValue(raw) }
-    recalculate(affectedCells([id]))
+    recalculate(new Set([id]))
   }
 
   function setManyRaw(start: CellCoord, matrix: string[][]) {
@@ -212,7 +331,7 @@ export const useSheetStore = defineStore('sheet', () => {
         changed.push(id)
       })
     })
-    recalculate(affectedCells(changed))
+    recalculate(new Set(changed))
   }
 
   function setActive(row: number, col: number, extend = false) {
@@ -262,10 +381,10 @@ export const useSheetStore = defineStore('sheet', () => {
     const previous = history.value.pop()
     if (!previous) return
     future.value.push(snapshot())
+    // 快照里已是同一批计算结果，直接恢复，不再重算
     cells.value = previous.cells
     active.value = previous.active
     selection.value = previous.selection
-    recalculate(new Set(Object.keys(cells.value)))
     status.value = '已撤销上一步编辑'
   }
 
@@ -273,10 +392,10 @@ export const useSheetStore = defineStore('sheet', () => {
     const next = future.value.pop()
     if (!next) return
     history.value.push(snapshot())
+    // 快照里已是同一批计算结果，直接恢复，不再重算
     cells.value = next.cells
     active.value = next.active
     selection.value = next.selection
-    recalculate(new Set(Object.keys(cells.value)))
     status.value = '已恢复编辑'
   }
 

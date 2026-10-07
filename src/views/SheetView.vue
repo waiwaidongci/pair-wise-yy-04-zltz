@@ -27,7 +27,7 @@ const store = useSheetStore()
     <main class="sheet-main"><SheetGrid /></main>
     <footer class="sheet-status">
       <span>方向键导航 · Shift+方向键扩展选区 · Ctrl/Cmd+C/V 复制粘贴 · F2 编辑</span>
-      <span>循环引用：拖入或粘贴 “=A1” 类公式会自动显示 #CYCLE!</span>
+      <span>循环引用按反复代入求解：连续两次变化小于阈值即收敛，超次数未收敛则保留最近结果并标出</span>
       <strong>{{ store.status }}</strong>
     </footer>
   </div>

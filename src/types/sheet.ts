@@ -4,6 +4,8 @@ export interface CellRecord {
   raw: string
   value: CellValue
   error?: string
+  /** 循环组迭代求解结果：false 表示代入到次数上限仍未收敛（保留最近一次结果） */
+  converged?: boolean
 }
 
 export interface CellCoord {
